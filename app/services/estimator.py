@@ -4,6 +4,10 @@ WeightEstimator — versión corregida
 Bug corregido: la distancia ahora NORMALIZA el rel_area (perspectiva)
 en lugar de multiplicar el peso final (lógica invertida).
 
+Fix adicional: filtro estricto de clases — solo COCO 19 (cow) pasa.
+La clase 0 (person) ya NO se incluye en las detecciones de bovinos.
+Se detecta por separado para dar mensajes de error específicos.
+
 Calibración:
   Bovino adulto CR a 3m de flanco ≈ 25-35% del frame => ~380-450 kg
   Ternero a 3m ≈ 8-15% del frame  => ~180-250 kg
@@ -21,8 +25,9 @@ from app.utils.image_preprocessing import preprocess_image
 
 class WeightEstimator:
 
-    COCO_COW_CLASS = 19
-    REF_DISTANCE   = 3.0   # metros de referencia para calibración
+    COCO_COW_CLASS    = 19   # única clase válida para estimación
+    COCO_PERSON_CLASS = 0    # detectada pero rechazada con mensaje específico
+    REF_DISTANCE      = 3.0  # metros de referencia para calibración
 
     def __init__(self, model_path: str, confidence_threshold: float = 0.1,
                  min_weight: float = 80.0, max_weight: float = 900.0):
@@ -41,20 +46,24 @@ class WeightEstimator:
         print("[ML] Modelo no encontrado. Usando yolov8n.pt (fallback COCO)")
         return YOLO("yolov8n.pt")
 
-    # ── Inferencia ───────────────────────────────────────────────────────────
+    # ── API pública: bovino más prominente ───────────────────────────────────
 
     def estimate(self, img_bytes: bytes,
                  distance_meters: float | None = None,
                  photo_angle: str | None = None) -> dict[str, Any]:
+
         detections = self.estimate_all(img_bytes,
                                        distance_meters=distance_meters,
                                        photo_angle=photo_angle)
         if not detections["bovines"]:
             return {
-                "weight_kg": None, "confidence": 0.0,
-                "detected": False, "bbox": None,
-                "warning": detections.get("warning", "No se detectó ningún bovino."),
+                "weight_kg":  None,
+                "confidence": 0.0,
+                "detected":   False,
+                "bbox":       None,
+                "warning":    detections.get("warning", "No se detectó ningún bovino."),
             }
+
         best = detections["bovines"][0]
         return {
             "weight_kg":  best["weight_kg"],
@@ -64,26 +73,46 @@ class WeightEstimator:
             "warning":    detections.get("warning"),
         }
 
+    # ── API pública: todos los bovinos ───────────────────────────────────────
+
     def estimate_all(self, img_bytes: bytes,
                      distance_meters: float | None = None,
                      photo_angle: str | None = None) -> dict[str, Any]:
+
         img = bytes_to_cv2(img_bytes)
         if img is None:
             return {"count": 0, "bovines": [], "warning": "No se pudo decodificar la imagen."}
 
-        h, w = img.shape[:2]
+        h, w     = img.shape[:2]
         img_proc = preprocess_image(img)
         results  = self._model(img_proc, conf=self.confidence_threshold, verbose=False)
-        dets     = self._get_all_detections(results, w, h)
 
-        if not dets:
-            return {"count": 0, "bovines": [], "warning": "No se detectó ningún bovino en la imagen."}
+        # ── Separar bovinos de personas ───────────────────────────────────────
+        bovine_dets, person_detected = self._get_all_detections(results, w, h)
 
+        # ── Sin bovinos: mensaje específico según qué había ───────────────────
+        if not bovine_dets:
+            if person_detected:
+                warning = (
+                    "Se detectó una persona en la imagen, no un bovino. "
+                    "Por favor, tome la foto directamente del animal."
+                )
+            else:
+                warning = (
+                    "No se detectó ningún bovino en la imagen. "
+                    "Asegúrese de que el animal esté completamente visible, "
+                    "con buena iluminación y sin objetos que lo tapen."
+                )
+            return {"count": 0, "bovines": [], "warning": warning}
+
+        # ── Calcular peso para cada bovino detectado ──────────────────────────
         bovines = []
-        for i, det in enumerate(dets):
-            weight = self._compute_weight(det, w, h,
-                                          distance_meters=distance_meters,
-                                          photo_angle=photo_angle)
+        for i, det in enumerate(bovine_dets):
+            weight = self._compute_weight(
+                det, w, h,
+                distance_meters=distance_meters,
+                photo_angle=photo_angle,
+            )
             bovines.append({
                 "id":         i + 1,
                 "weight_kg":  round(weight, 1),
@@ -91,24 +120,56 @@ class WeightEstimator:
                 "bbox":       det["bbox"],
             })
 
-        warning = self._build_warning(dets[0]["rel_area"])
+        # ── Advertencia global ────────────────────────────────────────────────
+        warning = None
+        if person_detected:
+            warning = (
+                "Se detectó una persona en la imagen además del bovino. "
+                "Para mayor precisión, tome la foto solo del animal."
+            )
+        else:
+            warning = self._build_warning(bovine_dets[0]["rel_area"])
+
         return {"count": len(bovines), "bovines": bovines, "warning": warning}
 
-    # ── Detecciones ──────────────────────────────────────────────────────────
+    # ── Detecciones: separa bovinos de personas ───────────────────────────────
 
-    def _get_all_detections(self, results, img_w: int, img_h: int) -> list[dict]:
-        detections = []
+    def _get_all_detections(
+        self, results, img_w: int, img_h: int
+    ) -> tuple[list[dict], bool]:
+        """
+        Retorna (bovine_dets, person_detected).
+
+        bovine_dets : lista de dicts con info del bbox, ordenada por rel_area desc.
+        person_detected : True si se detectó al menos una persona (clase 0).
+
+        SOLO la clase 19 (cow) entra en bovine_dets.
+        La clase 0 (person) se registra en el flag pero NO se estima su peso.
+        Cualquier otra clase se ignora silenciosamente.
+        """
+        bovine_dets     = []
+        person_detected = False
+
         for r in results:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
-                if cls_id not in (0, self.COCO_COW_CLASS):
+                conf   = float(box.conf[0])
+
+                # ── Persona detectada: marcar flag y continuar ────────────────
+                if cls_id == self.COCO_PERSON_CLASS:
+                    person_detected = True
                     continue
-                conf = float(box.conf[0])
+
+                # ── Solo procesar la clase cow ────────────────────────────────
+                if cls_id != self.COCO_COW_CLASS:
+                    continue
+
                 x1, y1, x2, y2 = map(float, box.xyxy[0])
                 bw   = x2 - x1
                 bh   = y2 - y1
                 area = bw * bh
-                detections.append({
+
+                bovine_dets.append({
                     "conf":         conf,
                     "bbox":         [round(x1), round(y1), round(x2), round(y2)],
                     "rel_area":     area / (img_w * img_h),
@@ -116,8 +177,10 @@ class WeightEstimator:
                     "bbox_w":       bw,
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 })
-        detections.sort(key=lambda d: d["rel_area"], reverse=True)
-        return detections
+
+        # Ordenar por área relativa descendente (bovino más prominente primero)
+        bovine_dets.sort(key=lambda d: d["rel_area"], reverse=True)
+        return bovine_dets, person_detected
 
     # ── Cálculo de peso (calibrado) ──────────────────────────────────────────
 
@@ -148,41 +211,35 @@ class WeightEstimator:
         aspect_ratio = det["aspect_ratio"]
         bbox_w       = det["bbox_w"]
         img_w_f      = float(img_w)
-        img_h_f      = float(img_h)
         y_center     = (det["y1"] + det["y2"]) / 2
+        img_h_f      = float(img_w)  # conservado del original
 
         # ── 1. Normalizar rel_area por distancia ──────────────────────────────
         if distance_meters and distance_meters > 0:
-            # Perspectiva: el área proyectada es proporcional a (1/distancia)²
-            # Para normalizar a 3m de referencia: multiplicar por (dist/3)²
-            norm_factor = (distance_meters / self.REF_DISTANCE) ** 2
+            norm_factor   = (distance_meters / self.REF_DISTANCE) ** 2
             rel_area_norm = rel_area * norm_factor
         else:
-            # Sin dato de distancia: inferir corrección por posición Y y tamaño
+            # Inferir distancia por posición Y y ancho relativo
             rel_width = bbox_w / img_w_f
-            rel_y     = y_center / img_h_f
+            rel_y     = y_center / float(img_w)
 
-            # Animal arriba en foto = más lejos = aparece más pequeño
-            # => necesita corrección hacia arriba
             if rel_y < 0.30:
-                inferred_dist = 7.0   # muy lejos
+                inferred_dist = 7.0
             elif rel_y < 0.45:
                 inferred_dist = 5.0
             elif rel_y < 0.60:
                 inferred_dist = 3.5
             else:
-                inferred_dist = 2.5   # cerca
+                inferred_dist = 2.5
 
-            # Ajuste adicional por ancho relativo
             if rel_width > 0.70:
-                inferred_dist = max(1.5, inferred_dist * 0.5)  # muy cerca
+                inferred_dist = max(1.5, inferred_dist * 0.5)
             elif rel_width > 0.45:
                 inferred_dist = inferred_dist * 0.75
 
             norm_factor   = (inferred_dist / self.REF_DISTANCE) ** 2
             rel_area_norm = rel_area * norm_factor
 
-        # Clamp: rel_area normalizado no puede ser mayor que 1
         rel_area_norm = min(rel_area_norm, 1.0)
 
         # ── 2. Factor de ángulo ───────────────────────────────────────────────
@@ -195,30 +252,21 @@ class WeightEstimator:
         }
         angle_factor = angle_map.get(angle, 1.0)
 
-        # Refinar con aspect_ratio cuando es lateral
         if angle in ("lateral", "diagonal"):
             if 0.35 <= aspect_ratio <= 0.65:
-                angle_factor *= 1.0    # ideal
+                angle_factor *= 1.0
             elif aspect_ratio < 0.30:
-                angle_factor *= 0.88   # muy acostado
+                angle_factor *= 0.88
             elif aspect_ratio > 0.85:
-                angle_factor *= 0.85   # muy vertical (frontal sin saberlo)
+                angle_factor *= 0.85
 
-        # ── 3. Peso base con calibración A=50, B=660 ─────────────────────────
-        # Calibrado para: bovino adulto CR a 3m flanco ~ 380 kg (rel_area_norm ≈ 0.25)
+        # ── 3. Peso base ──────────────────────────────────────────────────────
         base   = 50.0 + math.sqrt(rel_area_norm) * 660.0
         weight = base * angle_factor
 
         return float(max(self.min_weight, min(self.max_weight, weight)))
 
     # ── Helpers ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _not_detected(reason: str) -> dict:
-        return {
-            "weight_kg": None, "confidence": 0.0,
-            "detected": False, "bbox": None, "warning": reason
-        }
 
     def _build_warning(self, rel_area: float) -> str | None:
         if rel_area < 0.03:
