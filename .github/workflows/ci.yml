@@ -1,51 +1,54 @@
-name: CI/CD – ML Service
+name: CI/CD - ML Service
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
   pull_request:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
 
 jobs:
-
-  # CI – Tests
-
   test:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
       - name: Instalar dependencias
-        run: pip install flask flask-cors python-dotenv numpy opencv-python-headless Pillow pytest
+        run: |
+          pip install flask flask-cors python-dotenv numpy opencv-python-headless Pillow pytest
 
       - name: Ejecutar tests
         run: pytest tests/ -v
 
-
-  # CI – Build Docker (verifica que compila)
-
   docker-build:
     runs-on: ubuntu-latest
     needs: test
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Descargar codigo
+        uses: actions/checkout@v4
 
       - name: Build imagen Docker
         run: docker build -t bovweight-ml:latest .
 
-  # CD – Deploy al VPS (solo main)
-
-   deploy:
+  deploy:
     runs-on: ubuntu-latest
     needs: docker-build
     if: false
 
     steps:
       - name: Deploy desactivado temporalmente
-        run: echo "Deploy desactivado: no hay VPS configurado para este proyecto."
+        run: echo "Deploy desactivado porque no hay VPS configurado."
             
